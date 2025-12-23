@@ -1,0 +1,49 @@
+# Build directories
+build/
+cmake-build-*/
+out/
+
+# CMake generated files
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+compile_commands.json
+CTestTestfile.cmake
+_deps
+
+# Compiled binaries
+*.exe
+*.dll
+*.so
+*.dylib
+hpc_benchmark
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# CUDA
+*.ptx
+*.cubin
+
+# Metal
+*.air
+*.metallib
+
+# Data and results (optional - uncomment if you want to ignore)
+# data/
+# results/
+
+# Logs
+*.log
+
+# Temporary files
+*.tmp
+*.bak
