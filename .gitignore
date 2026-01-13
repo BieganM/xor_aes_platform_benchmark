@@ -47,6 +47,3 @@ Thumbs.db
 # Temporary files
 *.tmp
 *.bak
-
-# Article
-article/

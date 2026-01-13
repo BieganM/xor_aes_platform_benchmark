@@ -62,6 +62,7 @@ namespace hpc_benchmark
                   << "  --no-thread-scaling  Disable thread scaling tests\n"
                   << "  --max-threads <n>    Maximum threads for scaling tests (default: auto)\n"
                   << "  --output <file>      CSV output file (default: benchmark_results.csv)\n"
+                  << "  --block-size-sweep   Run block size sweep analysis\n"
                   << "  --help               Show this help message\n";
     }
 
@@ -102,10 +103,11 @@ namespace hpc_benchmark
 #endif
     }
 
-    bool parseArgs(int argc, char *argv[], Config &config)
+    bool parseArgs(int argc, char *argv[], Config &config, bool &blockSizeSweep)
     {
         config.maxThreads = std::thread::hardware_concurrency();
         config.outputFile = getPlatformName() + "_results.csv";
+        blockSizeSweep = false;
 
         for (int i = 1; i < argc; ++i)
         {
@@ -147,6 +149,10 @@ namespace hpc_benchmark
             else if (arg == "--output" && i + 1 < argc)
             {
                 config.outputFile = argv[++i];
+            }
+            else if (arg == "--block-size-sweep")
+            {
+                blockSizeSweep = true;
             }
         }
         return true;
@@ -218,7 +224,13 @@ namespace hpc_benchmark
         auto energyReading = powerMonitor.stopMeasurement();
 
         result.timeSec = timer.elapsedSeconds();
-        result.throughputMBs = static_cast<double>(result.fileSizeMB) / result.timeSec;
+        // Handle mostly empty files (very small block sizes < 1MB)
+        if (result.fileSizeMB == 0) {
+             result.throughputMBs = static_cast<double>(data.size()) / (1024.0 * 1024.0) / result.timeSec;
+        } else {
+             result.throughputMBs = static_cast<double>(result.fileSizeMB) / result.timeSec;
+        }
+        
         result.energyJoules = energyReading.joules;
         result.powerWatts = energyReading.watts;
         result.energySource = energyReading.source;
@@ -329,6 +341,103 @@ namespace hpc_benchmark
 
         std::cout << " | " << std::setw(6) << result.powerWatts << " W"
                   << " | " << (result.verified ? "PASS" : "FAIL") << "\n";
+    }
+
+    void printResultLine(std::string label, ICipherEngine* engine, int threads, 
+                         double throughput, double time, double speedup, double efficiency,
+                         double power, std::string status) {
+        std::cout << "  " << std::left << std::setw(12) << label
+                  << " | " << std::setw(10) << engine->getEngineName()
+                  << " | " << std::setw(3) << threads
+                  << " | " << std::fixed << std::setprecision(2) << std::setw(12) << throughput << " MB/s"
+                  << " | " << std::setw(8) << time << " s"
+                  << " | " << std::setw(6) << speedup
+                  << " | " << std::setw(9) << "-"
+                  << " | " << std::setw(6) << power << " W"
+                  << " | " << status << "\n";
+    }
+
+    void runBlockSizeSweep(const std::vector<std::unique_ptr<ICipherEngine>> &engines,
+                          PowerMonitor &powerMonitor,
+                          const Config &config)
+    {
+        std::cout << "\n================================================================================\n";
+        std::cout << "BLOCK SIZE SWEEP (64KB - 16MB)\n";
+        std::cout << "================================================================================\n";
+
+        const size_t TOTAL_SIZE_MB = 100;
+        const size_t TOTAL_BYTES = TOTAL_SIZE_MB * 1024 * 1024;
+        
+        std::vector<size_t> blockSizes = {
+            64 * 1024, 128 * 1024, 256 * 1024, 512 * 1024,
+            1 * 1024 * 1024, 2 * 1024 * 1024, 4 * 1024 * 1024, 8 * 1024 * 1024, 16 * 1024 * 1024
+        };
+
+        std::string csvName = "block_size_results.csv";
+        CsvLogger csv(csvName);
+        csv.writeHeader();
+
+        std::vector<uint8_t> key(32, 0xAA);
+        std::vector<uint8_t> iv(16, 0xBB);
+
+        for (const auto& engine : engines) {
+            if (!engine->isAvailable()) continue;
+        
+            // Skip Sequential engines for sweep to save time, unless user wants comparison.
+            // But Sequential scales linearly with size, block size shouldn't matter much unless cache effects.
+            // Let's keep them.
+
+            std::cout << "\nTesting " << engine->getAlgorithmName() << " - " << engine->getEngineName() << "\n";
+            std::cout << "  " << std::string(115, '-') << "\n";
+            std::cout << "  BlockSize    | Engine     | Thr | Throughput     | Time       | Speedup | Efficiency | Power  | Status\n";
+            std::cout << "  " << std::string(115, '-') << "\n";
+
+            for (size_t blockSize : blockSizes) {
+                size_t numChunks = TOTAL_BYTES / blockSize;
+                if (numChunks == 0) numChunks = 1;
+
+                std::vector<uint8_t> chunkData(blockSize);
+                std::fill(chunkData.begin(), chunkData.end(), 0xCC);
+
+                int threads = 1;
+                if (engine->getEngineName() == "OpenMP") {
+                    #ifdef HAS_OPENMP
+                    threads = omp_get_max_threads();
+                    // We must set engine threads
+                    // Casting to specific engine is messy here.
+                    // But we can just use default behavior (max threads).
+                    // Actually XorOpenMPEngine checks numThreads_ member.
+                    // We need a way to set it.
+                    // But engines are unique_ptr<ICipherEngine>.
+                    // Hack: We can assume engines are configured to default (0=Max) if not set.
+                    #endif
+                }
+
+                // If engine is OpenMP, we need to ensure it uses multiple threads.
+                // The current OpenMP engines default to max threads if not set.
+                // So that's fine.
+
+                auto res = runChunkedBenchmark(engine.get(), chunkData, key, iv, false, powerMonitor, 
+                                             config.iterations, threads, 
+                                             TOTAL_SIZE_MB, numChunks, 0.0);
+                
+                // Store Block Size in FileSize_MB for CSV logging (hacky but effective)
+                res.fileSizeMB = static_cast<double>(blockSize) / (1024.0 * 1024.0); 
+                
+                csv.writeResult(res);
+                
+                std::stringstream blockLabel;
+                if (blockSize < 1024*1024)
+                    blockLabel << (blockSize/1024) << " KB";
+                else
+                    blockLabel << (blockSize/(1024*1024)) << " MB";
+
+                printResultLine(blockLabel.str(), 
+                              engine.get(), threads, res.throughputMBs, res.timeSec, 0, 0, res.powerWatts, 
+                              res.verified ? "PASS" : "FAIL");
+            }
+        }
+        std::cout << "\nBlock size sweep completed. Results saved to " << csvName << "\n";
     }
 
     void runBenchmarks(const Config &config)
@@ -572,23 +681,63 @@ namespace hpc_benchmark
         std::cout << "Generate charts with: python3 scripts/generate_charts.py " << config.outputFile << "\n\n";
     }
 
-}
+} // namespace hpc_benchmark
 
 int main(int argc, char *argv[])
 {
     using namespace hpc_benchmark;
 
     Config config;
-    if (!parseArgs(argc, argv, config))
+    bool blockSizeSweep = false;
+
+    if (!parseArgs(argc, argv, config, blockSizeSweep))
     {
         return 0;
     }
 
-    printHeader();
-    printSystemInfo(config);
-
     try
     {
+        PowerMonitor powerMonitor;
+
+        std::vector<std::unique_ptr<hpc_benchmark::ICipherEngine>> engines;
+
+        // XOR Engines
+        engines.push_back(std::make_unique<hpc_benchmark::XorSequentialEngine>());
+#ifdef HAS_OPENMP
+        engines.push_back(std::make_unique<hpc_benchmark::XorOpenMPEngine>());
+#endif
+#ifdef HAS_OPENCL
+        engines.push_back(std::make_unique<hpc_benchmark::XorOpenCLEngine>());
+#endif
+#ifdef HAS_METAL
+        engines.push_back(std::make_unique<hpc_benchmark::XorMetalEngine>());
+#endif
+#ifdef HAS_CUDA
+        engines.push_back(std::make_unique<hpc_benchmark::XorCudaEngine>());
+#endif
+
+        // AES Engines
+        engines.push_back(std::make_unique<hpc_benchmark::AesSequentialEngine>());
+#ifdef HAS_OPENMP
+        engines.push_back(std::make_unique<hpc_benchmark::AesOpenMPEngine>());
+#endif
+#ifdef HAS_OPENCL
+        engines.push_back(std::make_unique<hpc_benchmark::AesOpenCLEngine>());
+#endif
+#ifdef HAS_METAL
+        engines.push_back(std::make_unique<hpc_benchmark::AesMetalEngine>());
+#endif
+#ifdef HAS_CUDA
+        engines.push_back(std::make_unique<hpc_benchmark::AesCudaEngine>());
+#endif
+
+         if (blockSizeSweep) {
+            runBlockSizeSweep(engines, powerMonitor, config);
+            return 0;
+        }
+
+        printHeader();
+        printSystemInfo(config);
         runBenchmarks(config);
     }
     catch (const std::exception &e)
